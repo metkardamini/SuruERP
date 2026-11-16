@@ -1,0 +1,13 @@
+# Secrets - never commit
+.env
+.env.*
+supabase/.temp/
+supabase/.branches/
+
+# Local test output
+node_modules/
+test-results/
+playwright-report/
+__pycache__/
+*.log
+.DS_Store
