@@ -8,6 +8,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap"/>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.119.0/dist/umd/supabase.js"></script>
 <style>:root{
   --accent:#0C9488;
   --accent-dark:#064D47;
@@ -4452,7 +4453,34 @@ var invPeriod='month', invTab='fg';
 
 // ── PERSISTENCE ──
 var PERSIST_KEY='suru_erp_v1';
-var BUILD_VERSION='v35'; // bump this with every new file handed to Damini — triggers a full reset to this file's seed data
+var BUILD_VERSION='v36'; // bump with every new file. From v36 a new version NO LONGER resets saved data.
+
+// ── SUPABASE (Phase 2) ──
+// Public project URL + publishable key: safe in the page; every table is protected by row-level security.
+var SB_URL='https://hjqgqevhqabpljbapzdw.supabase.co';
+var SB_KEY='sb_publishable_tIoEi1-J-qpSCJeHeBJvzA_A3I1UT0B';
+var sb=null;
+try{
+  if(window.supabase&&window.supabase.createClient){
+    sb=window.supabase.createClient(SB_URL,SB_KEY,{auth:{persistSession:true,autoRefreshToken:true,storageKey:'suru_erp_auth'}});
+  }
+}catch(e){console.warn('Supabase client failed to start: '+e.message);}
+// 4-digit PINs stay as typed; Supabase needs 6+ characters, so a fixed prefix is added here and in the database.
+function pinToPassword(pin){return 'Suru#'+pin;}
+function staffLoginEmail(staffId){return String(staffId).toLowerCase()+'@staff.suruerp.invalid';}
+function sbErrText(err){if(!err)return 'Unknown error';var m=err.message||String(err);return m.replace(/^.*?ERROR:\s*/,'');}
+// Staff and role permissions now live in Supabase: loaded after sign-in, never stored in the browser.
+function sbStaffToApp(r){return {id:r.id,name:r.name,role:r.role,active:r.active,stages:r.stages||[],_v:r.version};}
+async function sbLoadStaffAndPerms(){
+  var st=await sb.from('staff').select('id,name,role,stages,active,version').order('id');
+  if(st.error)throw st.error;
+  staffList=st.data.map(sbStaffToApp);
+  var rp=await sb.from('role_permissions').select('role,area,allowed');
+  if(rp.error)throw rp.error;
+  var merged=JSON.parse(JSON.stringify(DEFAULT_ROLE_PERMISSIONS));
+  rp.data.forEach(function(r){if(!merged[r.role])merged[r.role]={};merged[r.role][r.area]=!!r.allowed;});
+  rolePermissions=merged;
+}
 function save(){
   try{
     var payload={
@@ -4460,15 +4488,14 @@ function save(){
       POS:POS,orders:orders,rmOrders:rmOrders,stockItems:stockItems,
       inventory:inventory,drawings:drawings,bomEntries:bomEntries,
       partMaster:partMaster,suppliers:suppliers,customers:customers,
-      staffList:staffList,routings:routings,rejectedItems:rejectedItems,
+      routings:routings,rejectedItems:rejectedItems,
       fgBatches:fgBatches,tools:tools,dispatchQueues:dispatchQueues,
       stagesMaster:stagesMaster,actLog:actLog,
       companySettings:companySettings,batchCounters:batchCounters,
       productProcessHistory:productProcessHistory,
-      rmC:rmC,bomC:bomC,stockItemC:stockItemC,staffC:staffC,dwgC:dwgC,
+      rmC:rmC,bomC:bomC,stockItemC:stockItemC,dwgC:dwgC,
       dqC:dqC,cusC:cusC,routingC:routingC,invC:invC,supC:supC,
-      fgBatchC:fgBatchC,toolC:toolC,toolMoveC:toolMoveC,rejectedItemC:rejectedItemC,
-      rolePermissions:rolePermissions
+      fgBatchC:fgBatchC,toolC:toolC,toolMoveC:toolMoveC,rejectedItemC:rejectedItemC
     };
     localStorage.setItem(PERSIST_KEY,JSON.stringify(payload));
   }catch(e){
@@ -4503,38 +4530,19 @@ function loadSaved(){
     var raw=localStorage.getItem(PERSIST_KEY);
     if(!raw)return false;
     var d=JSON.parse(raw);
-    var isNewFile = d.buildVersion!==BUILD_VERSION; // a newer/older file was opened vs. what was last saved here
-    if(isNewFile){
-      // A new file version — start clean from THIS file's in-code seed for everything (master data
-      // included). This is deliberate: if Claude changes seed data in code (e.g. a PIN reset), that
-      // change must win over whatever was left in the browser from an older file. Only same-version
-      // reloads (below) restore from localStorage.
-      toast('New file version detected — reset to this file\'s seed data (staff, POs, orders, etc.). Nothing carried over from the previous file.','ok');
-      save();
-      return true;
-    }
+    // From v36 a new build NEVER wipes saved data (that reset would destroy live data once it is shared).
+    // Staff, PINs and role permissions are no longer read from the browser: they come from Supabase.
     if(d.stockItems&&d.stockItems.length>0)stockItems=d.stockItems;
     if(d.partMaster&&d.partMaster.length>0)partMaster=d.partMaster;
     repairDuplicatePartMasterIds();
     if(d.suppliers)suppliers=d.suppliers;
     if(d.customers)customers=d.customers;
-    if(d.staffList)staffList=d.staffList;
-    if(d.rolePermissions){
-      // Migration-safe merge: start from defaults, then overlay any saved values — so a role or
-      // area added in a later build always has a sane default instead of ending up undefined.
-      var mergedPerms=JSON.parse(JSON.stringify(DEFAULT_ROLE_PERMISSIONS));
-      Object.keys(d.rolePermissions).forEach(function(r){
-        if(!mergedPerms[r])mergedPerms[r]={};
-        Object.keys(d.rolePermissions[r]).forEach(function(a){mergedPerms[r][a]=d.rolePermissions[r][a];});
-      });
-      rolePermissions=mergedPerms;
-    }
     if(d.routings)routings=d.routings;
     if(d.drawings)drawings=d.drawings;
     if(d.bomEntries)bomEntries=d.bomEntries;
     if(d.stagesMaster)stagesMaster=d.stagesMaster;
     if(d.companySettings)companySettings=Object.assign(companySettings,d.companySettings);
-    if(d.stockItemC!=null)stockItemC=d.stockItemC;if(d.staffC!=null)staffC=d.staffC;
+    if(d.stockItemC!=null)stockItemC=d.stockItemC;
     if(d.dwgC!=null)dwgC=d.dwgC;if(d.cusC!=null)cusC=d.cusC;
     if(d.routingC!=null)routingC=d.routingC;if(d.invC!=null)invC=d.invC;if(d.supC!=null)supC=d.supC;
     if(d.bomC!=null)bomC=d.bomC;
@@ -12126,9 +12134,17 @@ function toggleRolePerm(role,areaKey,checked){
   rolePermissions[role][areaKey]=!!checked;
 }
 function saveRolePermissions(){
-  save();
-  applyRoleNav();
-  toast('Roles & permissions saved.','ok');
+  var rows=[];
+  Object.keys(rolePermissions).forEach(function(role){
+    if(role==='admin')return; // Admin is always full access in the database too
+    PERM_AREAS.forEach(function(a){rows.push({role:role,area:a.key,allowed:!!(rolePermissions[role]&&rolePermissions[role][a.key])});});
+  });
+  sb.from('role_permissions').upsert(rows,{onConflict:'role,area'}).then(async function(r){
+    if(r.error){toast('Could not save permissions: '+sbErrText(r.error),'warn');return;}
+    try{await sbLoadStaffAndPerms();}catch(x){}
+    applyRoleNav();renderRolesPerms();
+    toast('Roles & permissions saved. Each person sees the change at their next login.','ok');
+  });
 }
 // ── Error Log page ──
 var errLogFilter='all';
@@ -12228,7 +12244,7 @@ function renderStaffMaster(){
 }
 function openStaff(){
   ['sf-n','sf-p'].forEach(function(id){setVal(id,'');});
-  setVal('sf-i','ST-'+String(staffC).padStart(3,'0')+' (auto-generated)');
+  setVal('sf-i','Assigned on save');
   qid('sf-r').value='staff';qid('sf-e').classList.remove('show');qid('sa-wrap').style.display='block';
   var cb=qid('sa-cb');
   if(cb)cb.innerHTML=STAGES.map(function(s){return '<label style="display:flex;align-items:center;gap:5px;font-size:12px;cursor:pointer;padding:2px 0"><input type="checkbox" value="'+s+'" style="width:auto;accent-color:var(--accent)"/> '+s+'</label>';}).join('');
@@ -12236,8 +12252,32 @@ function openStaff(){
   openM('m-staff');
 }
 function toggleSA(){qid('sa-wrap').style.display=qid('sf-r').value==='staff'?'block':'none';}
-function subStaff(){var n=val('sf-n'),pin=val('sf-p'),role=qid('sf-r').value;var e=qid('sf-e');if(!n||!pin){e.textContent='All fields required.';e.classList.add('show');return;}if(pin.length!==4||!/^\d+$/.test(pin)){e.textContent='PIN must be 4 digits.';e.classList.add('show');return;}var id='ST-'+String(staffC++).padStart(3,'0');var stages=role==='staff'?[...document.querySelectorAll('#sa-cb input:checked')].map(function(cb){return cb.value;}):[];staffList.unshift({id:id,name:n,role:role,pin:pin,active:true,stages:stages});closeM('m-staff');renderStaffMaster();toast(n+' added as '+id+'.','ok');}
-function togStaff(id){var s=staffList.find(function(x){return x.id===id;});if(s){s.active=!s.active;renderStaffMaster();}}
+function subStaff(){
+  var n=val('sf-n'),pin=val('sf-p'),role=qid('sf-r').value;var e=qid('sf-e');
+  if(!n||!pin){e.textContent='All fields required.';e.classList.add('show');return;}
+  if(pin.length!==4||!/^\d+$/.test(pin)){e.textContent='PIN must be 4 digits.';e.classList.add('show');return;}
+  var stages=role==='staff'?[...document.querySelectorAll('#sa-cb input:checked')].map(function(cb){return cb.value;}):[];
+  // One database call creates the staff row, its ID and its login.
+  sb.rpc('create_staff',{p_name:n,p_role:role,p_stages:stages,p_pin:pin}).then(async function(r){
+    if(r.error){e.textContent=sbErrText(r.error);e.classList.add('show');return;}
+    try{await sbLoadStaffAndPerms();}catch(x){}
+    closeM('m-staff');renderStaffMaster();toast(n+' added as '+r.data+'. They can log in with the PIN you set.','ok');
+  });
+}
+function togStaff(id){
+  var s=staffList.find(function(x){return x.id===id;});if(!s)return;
+  if(currentUser&&s.id===currentUser.id){toast('You cannot deactivate your own login.','warn');return;}
+  // Send the version we read: if someone else changed this person meanwhile, the database refuses.
+  sb.from('staff').update({active:!s.active,version:s._v}).eq('id',id).select('id,name,role,stages,active,version').then(async function(r){
+    if(r.error){
+      if(r.error.code==='40001'){toast('Someone else just changed this staff record. Reloaded the latest — please try again.','warn');}
+      else{toast('Could not update staff: '+sbErrText(r.error),'warn');}
+    }else if(!r.data||!r.data.length){toast('Only Admin can change staff.','warn');}
+    else{toast(s.name+(r.data[0].active?' activated.':' deactivated — they can no longer log in.'),'ok');}
+    try{await sbLoadStaffAndPerms();}catch(x){}
+    renderStaffMaster();
+  });
+}
 function adminReset(){var oid=val('adm-oid'),pw=val('adm-pw');if(!oid||!pw){toast('Enter Order ID and password.','warn');return;}var o=orders.find(function(x){return x.id===oid;});if(!o){toast('Order ID not found.','warn');return;}o.pass=pw;qid('adm-ok').style.display='block';setTimeout(function(){qid('adm-ok').style.display='none';},4000);}
 
 // ── AI ──
@@ -13792,18 +13832,7 @@ ensureRMBatches(); // Must be called AFTER all seeded stockItems are pushed
 
 
 // SEED DATA
-staffList=[
-  {id:"ST-001",name:"Damini Metkar",role:"admin",pin:"1234",active:true,stages:[]},
-  {id:"ST-002",name:"Omkar Murtak",role:"admin",pin:"1234",active:true,stages:[]},
-  {id:"ST-003",name:"Raju Patil",role:"staff",pin:"1234",active:true,stages:["Cutting","CNC machining","VMC machining"]},
-  {id:"ST-004",name:"Suresh Shinde",role:"staff",pin:"1234",active:true,stages:["Grinding","Bending","Laser cutting"]},
-  {id:"ST-005",name:"Store Executive",role:"store",pin:"1234",active:true,stages:[]},
-  {id:"ST-006",name:"QC Engineer",role:"qi",pin:"1234",active:true,stages:[]},
-  {id:"ST-007",name:"Production Manager",role:"prodmgr",pin:"1234",active:true,stages:[]},
-  {id:"ST-008",name:"Planning Engineer",role:"ppc",pin:"1234",active:true,stages:[]},
-  {id:"ST-009",name:"Purchase Executive",role:"purchase",pin:"1234",active:true,stages:[]},
-  {id:"ST-010",name:"Dispatch Executive",role:"dispatch",pin:"1234",active:true,stages:[]},
-];
+staffList=[]; // loaded from Supabase after sign-in (no PINs in this file)
 
 suppliers=[
   {id:"SUP-001",name:"Kalyani Steels Pvt. Ltd.",code:"SUP-KAL-001",contact:"Rajesh Kumar",phone:"+91 98765 43210",email:"rajesh@kalyanisteels.com",city:"Nashik",mats:"EN8, EN24, SS316",gst:"27AABCK1234F1ZX",pan:"AABCK1234F",msme:"",bank:"SBI",acc:"12345678901234",ifsc:"SBIN0001234",terms:"Net 30 days",lead:7,active:true,vendorType:"rm"},
@@ -16137,13 +16166,35 @@ function lsSetTab(tab){
   tp.style.boxShadow=isAdmin?'none':'0 1px 3px rgba(0,0,0,.1)';
 }
 
+var lsDirectory=[];
+async function lsLoadDirectory(){
+  var errEl=qid('ls-err');
+  if(!sb){errEl.style.display='block';errEl.textContent='Cannot reach the ERP server. Check the internet connection and refresh.';lsDirectory=[];lsPopulateDropdowns();return;}
+  try{
+    var r=await sb.rpc('login_directory');
+    if(r.error)throw r.error;
+    lsDirectory=r.data||[];
+    var b=await sb.rpc('login_branding');
+    if(!b.error&&b.data&&b.data[0]){
+      var br=b.data[0];
+      if(br.name)companySettings.name=br.name;
+      if(br.short_name)companySettings.shortName=br.short_name;
+      if(br.tagline)companySettings.tagline=br.tagline;
+    }
+    if(errEl.textContent.indexOf('Cannot reach')===0)errEl.style.display='none';
+  }catch(e){
+    lsDirectory=[];
+    errEl.style.display='block';errEl.textContent='Cannot load the user list ('+sbErrText(e)+'). Check the internet connection and refresh.';
+  }
+  lsPopulateDropdowns();
+}
 function lsPopulateDropdowns(){
-  // Admin/all-roles dropdown — everyone except pure production staff
+  // Admin/all-roles dropdown — everyone except pure production staff. Names come from Supabase.
   var adminSel = qid('ls-user');
   var prodSel = qid('ls-prod-user');
   adminSel.innerHTML = '<option value="">Select...</option>';
   prodSel.innerHTML = '<option value="">Select...</option>';
-  staffList.filter(function(s){return s.active;}).forEach(function(s){
+  lsDirectory.forEach(function(s){
     var opt = '<option value="'+s.id+'">'+s.name+' ('+( roleLabels[s.role]||s.role)+')</option>';
     if(s.role==='staff'){
       prodSel.innerHTML += opt;
@@ -16167,16 +16218,44 @@ function lsPopulateDropdowns(){
   if(lsDaivo)lsDaivo.innerHTML='<img src="'+DAIVO_BRANDING.iconCompact+'" style="width:100%;height:100%;object-fit:cover;border-radius:3px"/>';
 }
 
-function doLogin(){
+var lsBusy=false;
+async function doLogin(){
+  if(lsBusy)return;
   var isAdmin = lsCurrentTab==='admin';
   var selId = isAdmin?val('ls-user'):val('ls-prod-user');
   var pin = isAdmin?val('ls-pin'):val('ls-prod-pin');
   var errEl = qid('ls-err');
-  if(!selId||!pin){errEl.style.display='block';errEl.textContent='Please select a user and enter your PIN.';return;}
-  var staff = staffList.find(function(s){return s.id===selId;});
-  if(!staff||!staff.active){errEl.style.display='block';errEl.textContent='User not found.';return;}
-  if(staff.pin!==pin){errEl.style.display='block';errEl.textContent='Incorrect PIN. Please try again.';return;}
+  var showErr=function(m){errEl.style.display='block';errEl.textContent=m;};
+  if(!selId||!pin){showErr('Please select a user and enter your PIN.');return;}
+  if(!/^\d{4}$/.test(pin)){showErr('PIN must be 4 digits.');return;}
+  if(!sb){showErr('Cannot reach the ERP server. Check the internet connection and refresh.');return;}
+  lsBusy=true;
+  try{
+    var res=await sb.auth.signInWithPassword({email:staffLoginEmail(selId),password:pinToPassword(pin)});
+    if(res.error){
+      var m=res.error.message||'';
+      showErr(/invalid login credentials/i.test(m)?'Incorrect PIN. Please try again.':(/rate limit|too many/i.test(m)?'Too many attempts. Wait a few minutes and try again.':'Could not sign in: '+m));
+      return;
+    }
+    await sbEnterApp();
+  }catch(e){showErr('Could not sign in: '+sbErrText(e));}
+  finally{lsBusy=false;}
+}
+// After a successful sign-in (or a still-valid session on page load): who am I, then staff + permissions.
+async function sbEnterApp(){
+  var errEl = qid('ls-err');
+  var me=await sb.rpc('my_session');
+  if(me.error)throw me.error;
+  var staff=me.data;
+  if(!staff||!staff.active){
+    await sb.auth.signOut();
+    errEl.style.display='block';errEl.textContent='This login is not active. Please contact your Admin.';
+    return;
+  }
+  await sbLoadStaffAndPerms();
   errEl.style.display='none';
+  if(qid('ls-pin'))qid('ls-pin').value='';
+  if(qid('ls-prod-pin'))qid('ls-prod-pin').value='';
   // Set currentUser
   var initials = staff.name.split(' ').map(function(w){return w[0];}).join('').toUpperCase().slice(0,2);
   currentUser = {id:staff.id, name:staff.name, role:staff.role, initials:initials, stages:staff.stages||[]};
@@ -16244,11 +16323,12 @@ function confirmSwitchUser(){
   // right tab immediately instead of always landing back on Admin/Office.
   var tabForRole=(currentUser&&currentUser.role==='staff')?'prod':'admin';
   currentUser=null;
+  if(sb)sb.auth.signOut().catch(function(){});
   qid('app').style.display='none';
   qid('login-screen').style.display='flex';
   if(qid('ls-pin'))qid('ls-pin').value='';
   if(qid('ls-prod-pin'))qid('ls-prod-pin').value='';
-  lsPopulateDropdowns();
+  lsLoadDirectory();
   lsSetTab(tabForRole);
   toast('Ready for the next user to sign in.','ok');
 }
@@ -16261,19 +16341,18 @@ function openSetPin(){
 function subSetPin(){
   var e=qid('set-pin-err');
   var cur=val('sp-current').trim(), nw=val('sp-new').trim(), cf=val('sp-confirm').trim();
-  var me=staffList.find(function(s){return currentUser&&s.id===currentUser.id;});
-  if(!me){e.textContent='Could not find your user record.';e.classList.add('show');return;}
-  // No real second factor is possible in a single-file, no-backend Phase 1 app — requiring the
-  // current PIN before allowing a new one is the honest interim safeguard, not a false claim of 2FA.
-  if(cur!==me.pin){e.textContent='Current PIN is incorrect.';e.classList.add('show');return;}
+  if(!currentUser){e.textContent='Could not find your user record.';e.classList.add('show');return;}
+  if(!/^\d{4}$/.test(cur)){e.textContent='Enter your current 4-digit PIN.';e.classList.add('show');return;}
   if(!/^\d{4}$/.test(nw)){e.textContent='New PIN must be exactly 4 digits.';e.classList.add('show');return;}
   if(nw!==cf){e.textContent='New PIN and confirmation do not match.';e.classList.add('show');return;}
   if(nw===cur){e.textContent='New PIN must be different from the current PIN.';e.classList.add('show');return;}
   e.classList.remove('show');
-  me.pin=nw;
-  save();
-  closeM('m-set-pin');
-  toast('PIN updated.','ok');
+  // The database checks the current PIN against the stored (hashed) one before changing it.
+  sb.rpc('set_staff_pin',{p_staff_id:currentUser.id,p_new_pin:nw,p_current_pin:cur}).then(function(r){
+    if(r.error){e.textContent=sbErrText(r.error);e.classList.add('show');return;}
+    closeM('m-set-pin');
+    toast('PIN updated. Use the new PIN next time you log in.','ok');
+  });
 }
 function openAboutVersion(){
   toggleProfileMenu();
@@ -16294,12 +16373,13 @@ function confirmLogout(){
 function doLogout(){
   closeM('m-logout');
   currentUser = null;
+  if(sb)sb.auth.signOut().catch(function(){});
   qid('app').style.display='none';
   qid('login-screen').style.display='flex';
   // Clear PIN inputs
   if(qid('ls-pin'))qid('ls-pin').value='';
   if(qid('ls-prod-pin'))qid('ls-prod-pin').value='';
-  lsPopulateDropdowns();
+  lsLoadDirectory();
   toast('You have been successfully logged out.','ok');
 }
 
@@ -19142,7 +19222,22 @@ function renderRMStock(){
 
 // Init login screen dropdowns — must run here, after ALL seed data (staffList, etc.) is loaded,
 // not earlier in the script where staffList was still an empty placeholder array.
-(function(){try{lsPopulateDropdowns();}catch(e){console.error('lsPopulateDropdowns failed: '+e.message);raiseAlert('SYS-003','Login screen failed to load user list ('+e.message+') — please refresh the page.');}})();
+(function(){
+  try{lsPopulateDropdowns();}catch(e){console.error('lsPopulateDropdowns failed: '+e.message);raiseAlert('SYS-003','Login screen failed to load user list ('+e.message+') — please refresh the page.');}
+  lsLoadDirectory();
+  // A session that is still valid (e.g. after an accidental refresh) goes straight back in.
+  if(sb){sb.auth.getSession().then(function(r){
+    if(r&&r.data&&r.data.session){sbEnterApp().catch(function(e){console.warn('Session restore failed: '+sbErrText(e));});}
+  });}
+  // Offline banner: the ERP needs the internet to save to the server.
+  var ob=document.createElement('div');
+  ob.id='offline-banner';
+  ob.style.cssText='display:none;position:fixed;top:0;left:0;right:0;z-index:99999;background:#A32D2D;color:#fff;text-align:center;font-size:13px;font-weight:600;padding:8px';
+  ob.textContent='You are offline — changes will NOT be saved to the server until the connection is back.';
+  document.body.appendChild(ob);
+  var setOb=function(){ob.style.display=navigator.onLine?'none':'block';};
+  window.addEventListener('online',setOb);window.addEventListener('offline',setOb);setOb();
+})();
 </script>
 </body>
 </html>
