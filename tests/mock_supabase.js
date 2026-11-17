@@ -29,6 +29,20 @@
         { id: 'ST-004', name: 'Demo Staff 4', role: 'qi', stages: [], active: true, version: 1, pin: '4444' }
       ],
       role_permissions: rp,
+      customers: [
+        { id: 'CUS-001', name: 'Demo Customer 1', contact: 'Demo Contact 1', terms: 'Net 30 days', active: true, credit_limit: null, address_history: [], extra: {}, version: 1 },
+        { id: 'CUS-002', name: 'Demo Customer 2', contact: 'Demo Contact 2', terms: 'Net 45 days', active: true, credit_limit: null, address_history: [], extra: {}, version: 1 }
+      ],
+      suppliers: [
+        { id: 'SUP-001', code: 'SUP-DEMO-001', name: 'Demo Supplier 1', contact: 'Demo Contact 1', city: 'Nashik', materials: 'EN8, SS316', terms: 'Net 30 days', lead_days: 7, active: true, extra: {}, version: 1 },
+        { id: 'SUP-002', code: 'SUP-DEMO-002', name: 'Demo Supplier 2', contact: 'Demo Contact 2', city: 'Pune', materials: 'SS316L, Duplex', terms: 'Net 45 days', lead_days: 10, active: true, extra: {}, version: 1 }
+      ],
+      supplier_bank_details: [],
+      stages_master: ['Raw material inward|rm','Cutting|machining','CNC machining|machining','VMC machining|machining','Laser cutting|machining','Grinding|machining','Bending|machining','Heat treatment|outsource','Plating / Coating|outsource','Threading|machining','Welding|machining','Assembly|machining'].map(function (x, i) {
+        var p = x.split('|'); return { id: 'STG-' + String(i + 1).padStart(3, '0'), name: p[0], category: p[1], can_qc_after: true, sort_order: i + 1, extra: {}, version: 1 };
+      }),
+      company_settings: [{ id: 1, name: 'Suru Industries', short_name: 'S', tagline: 'Precision Manufacturing', address: 'Malegaon MIDC, Sinnar', brand_color: '#F5C518', extra: {}, version: 1 }],
+      counters: { CUS: 2, SUP: 2, STG: 12 },
       nextSt: 5,
       calls: []
     };
@@ -50,14 +64,28 @@
   function ok(d) { return Promise.resolve({ data: d, error: null }); }
   var pub = function (row) { var c = Object.assign({}, row); delete c.pin; return c; };
 
+  // Who may change each table (mirrors migration 005).
+  var WRITE = {
+    staff: function (db) { return can(db, 'adminhub'); },
+    role_permissions: function (db) { return can(db, 'adminhub'); },
+    company_settings: function (db) { return can(db, 'adminhub'); },
+    customers: function (db) { return can(db, 'poinbox') || can(db, 'adminhub'); },
+    suppliers: function (db) { var u = me(db); return u && (u.role === 'admin' || u.role === 'purchase'); },
+    supplier_bank_details: function (db) { var u = me(db); return u && (u.role === 'admin' || u.role === 'purchase'); },
+    stages_master: function (db) { return can(db, 'productdata'); }
+  };
+  var READ = { supplier_bank_details: WRITE.supplier_bank_details };
+  var KEY = { supplier_bank_details: 'supplier_id', role_permissions: null };
   function query(table) {
-    var q = { table: table, filters: [], op: 'select', payload: null, opts: null };
+    var q = { table: table, filters: [], op: 'select', payload: null };
     var api = {
-      select: function () { if (q.op === 'none') q.op = 'select'; q.wantRows = true; return api; },
-      order: function () { return api; },
+      select: function () { return api; },
+      order: function (c) { q.order = c; return api; },
       eq: function (c, v) { q.filters.push([c, v]); return api; },
+      insert: function (p) { q.op = 'insert'; q.payload = p; return api; },
       update: function (p) { q.op = 'update'; q.payload = p; return api; },
-      upsert: function (rows, o) { q.op = 'upsert'; q.payload = rows; q.opts = o; return api; },
+      delete: function () { q.op = 'delete'; return api; },
+      upsert: function (rows) { q.op = 'upsert'; q.payload = rows; return api; },
       then: function (res, rej) { return run(q).then(res, rej); }
     };
     return api;
@@ -66,19 +94,39 @@
     var db = load(); var u = me(db);
     db.calls.push({ table: q.table, op: q.op }); saveDb(db);
     if (!u || !u.active) return ok([]);
-    var rows = db[q.table].filter(function (r) { return q.filters.every(function (f) { return r[f[0]] === f[1]; }); });
-    if (q.op === 'select') return ok(rows.map(pub));
+    var t = db[q.table];
+    var match = function (r) { return q.filters.every(function (f) { return r[f[0]] === f[1]; }); };
+    var w = WRITE[q.table] ? WRITE[q.table](db) : false;
+    if (q.op === 'select') {
+      if (READ[q.table] && !READ[q.table](db)) return ok([]);
+      var rows = t.filter(match).map(pub);
+      if (q.order) rows.sort(function (a, b) { return a[q.order] > b[q.order] ? 1 : -1; });
+      return ok(rows);
+    }
+    if (q.op === 'insert') {
+      if (!w) return Promise.resolve(err('new row violates row-level security policy', '42501'));
+      var key = KEY[q.table] || 'id';
+      if (t.some(function (r) { return r[key] === q.payload[key]; })) return Promise.resolve(err('duplicate key value', '23505'));
+      if (q.table === 'supplier_bank_details' && !db.suppliers.some(function (x) { return x.id === q.payload.supplier_id; }))
+        return Promise.resolve(err('violates foreign key constraint', '23503'));
+      var nr = Object.assign({ version: 1 }, q.payload); nr.version = 1; t.push(nr); saveDb(db); return ok([pub(nr)]);
+    }
     if (q.op === 'update') {
-      if (q.table === 'staff' && !can(db, 'adminhub')) return ok([]);
-      for (var i = 0; i < rows.length; i++) {
-        if ('version' in q.payload && q.payload.version !== rows[i].version)
-          return Promise.resolve(err('stale_row: this staff record was changed by someone else - reload and try again', '40001'));
+      if (!w) return ok([]);
+      var hits = t.filter(match);
+      for (var i = 0; i < hits.length; i++) {
+        if ('version' in q.payload && q.payload.version !== hits[i].version)
+          return Promise.resolve(err('stale_row: this ' + q.table + ' record was changed by someone else - reload and try again', '40001'));
       }
-      rows.forEach(function (r) { Object.assign(r, q.payload); r.version += 1; });
-      saveDb(db); return ok(rows.map(pub));
+      hits.forEach(function (r) { var v = r.version; Object.assign(r, q.payload); r.version = v + 1; });
+      saveDb(db); return ok(hits.map(pub));
+    }
+    if (q.op === 'delete') {
+      if (!w) return ok([]);
+      var gone = t.filter(match); db[q.table] = t.filter(function (r) { return !match(r); }); saveDb(db); return ok(gone.map(pub));
     }
     if (q.op === 'upsert') {
-      if (!can(db, 'adminhub')) return Promise.resolve(err('new row violates row-level security policy', '42501'));
+      if (!w) return Promise.resolve(err('new row violates row-level security policy', '42501'));
       q.payload.forEach(function (p) {
         var r = db.role_permissions.find(function (x) { return x.role === p.role && x.area === p.area; });
         if (r) { r.allowed = p.allowed; r.version += 1; } else db.role_permissions.push(Object.assign({ version: 1 }, p));
@@ -99,6 +147,11 @@
       if (args.p_staff_id === u.id) { if (args.p_current_pin !== u.pin) return Promise.resolve(err('Current PIN is incorrect')); }
       else if (!can(db, 'adminhub')) return Promise.resolve(err("Only Admin can set another person's PIN"));
       db.staff.find(function (s) { return s.id === args.p_staff_id; }).pin = args.p_new_pin; saveDb(db); return ok(null);
+    }
+    if (name === 'next_id') {
+      db.counters[args.p_prefix] = (db.counters[args.p_prefix] || 0) + 1; saveDb(db);
+      var pad = { CUS: 3, SUP: 3, STG: 3 }[args.p_prefix] || 4;
+      return ok(args.p_prefix + '-' + String(db.counters[args.p_prefix]).padStart(pad, '0'));
     }
     if (name === 'create_staff') {
       if (!can(db, 'adminhub')) return Promise.resolve(err('Only Admin can add staff'));

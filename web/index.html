@@ -443,6 +443,14 @@ function toggleSbGroup(g){
   if(chev)chev.classList.toggle('collapsed',collapsed);
 }
 function showPage(p) {
+  // v37: these pages read master data that other people may have changed — fetch the latest.
+  try{
+    if(typeof sb!=='undefined'&&sb&&currentUser){
+      if(p==='customers')sbReload('customers');
+      else if(p==='sups')sbReload('suppliers');
+      else if(p==='adminhub'){sbReload('companySettings');sbReload('stagesMaster');}
+    }
+  }catch(e){}
   // If real showPage not loaded yet, queue it
   if (window._showPageReady) {
     window._realShowPage(p);
@@ -4453,7 +4461,7 @@ var invPeriod='month', invTab='fg';
 
 // ── PERSISTENCE ──
 var PERSIST_KEY='suru_erp_v1';
-var BUILD_VERSION='v36'; // bump with every new file. From v36 a new version NO LONGER resets saved data.
+var BUILD_VERSION='v37'; // bump with every new file. From v36 a new version NO LONGER resets saved data.
 
 // ── SUPABASE (Phase 2) ──
 // Public project URL + publishable key: safe in the page; every table is protected by row-level security.
@@ -4481,20 +4489,159 @@ async function sbLoadStaffAndPerms(){
   rp.data.forEach(function(r){if(!merged[r.role])merged[r.role]={};merged[r.role][r.area]=!!r.allowed;});
   rolePermissions=merged;
 }
+
+// ── TABLE SYNC ENGINE (v37) ──
+// Collections that live in Supabase. Each screen keeps editing the same in-memory arrays as before;
+// save() (called on every action, every 4 s and on page close) compares them with what was last read
+// from the database and writes only the rows that changed. A row edited by someone else in the meantime
+// is refused by the database (version check) and the latest data is reloaded instead of overwritten.
+function sbNum(v){if(v===''||v==null)return null;var n=parseFloat(String(v).replace(/,/g,''));return isNaN(n)?null:n;}
+function sbNumStr(v){return v==null?'':Number(v).toLocaleString('en-IN');}
+var SB_SYNC={
+  customers:{table:'customers',key:'id',label:'customer',
+    get:function(){return customers;},set:function(v){customers=v;},
+    cols:{id:'id',name:'name',gst:'gst',pan:'pan',address:'address',contact:'contact',email:'email',phone:'phone',terms:'terms',active:'active',credit:'credit_limit',addressHistory:'address_history'},
+    toDb:{credit:sbNum},fromDb:{credit:sbNumStr}},
+  suppliers:{table:'suppliers',key:'id',label:'supplier',
+    get:function(){return suppliers;},set:function(v){suppliers=v;},
+    cols:{id:'id',code:'code',name:'name',contact:'contact',phone:'phone',email:'email',city:'city',mats:'materials',gst:'gst',pan:'pan',msme:'msme',terms:'terms',lead:'lead_days',vendorType:'vendor_type',active:'active'},
+    omit:['bank','acc','ifsc'],toDb:{lead:function(v){var n=parseInt(v,10);return isNaN(n)?null:n;}}},
+  // Bank details sit in their own table that only Admin and Purchase can read or change.
+  supplierBank:{table:'supplier_bank_details',key:'supplier_id',label:'supplier bank details',
+    enabled:function(){return currentUser&&(currentUser.role==='admin'||currentUser.role==='purchase');},
+    get:function(){return suppliers.filter(function(x){return x.bank||x.acc||x.ifsc||SB_STATE.supplierBank.snap[x.id];}).map(function(x){return {supplier_id:x.id,bank:x.bank||null,acc:x.acc||null,ifsc:x.ifsc||null};});},
+    set:function(rows){var m={};rows.forEach(function(r){m[r.supplier_id]=r;});suppliers.forEach(function(x){var r=m[x.id];x.bank=r?r.bank||'':'';x.acc=r?r.acc||'':'';x.ifsc=r?r.ifsc||'':'';});},
+    cols:{supplier_id:'supplier_id',bank:'bank',acc:'account_no',ifsc:'ifsc'},noExtra:true,noDelete:true},
+  stagesMaster:{table:'stages_master',key:'id',label:'stage',order:'sort_order',
+    get:function(){return stagesMaster;},set:function(v){stagesMaster=v;},
+    cols:{id:'id',name:'name',category:'category',canQCAfter:'can_qc_after'}},
+  companySettings:{table:'company_settings',key:'id',label:'company settings',noDelete:true,
+    get:function(){var r={id:1};Object.keys(companySettings).forEach(function(k){r[k]=companySettings[k];});return [r];},
+    set:function(rows){if(rows[0]){var r=rows[0];delete r.id;Object.assign(companySettings,r);}},
+    cols:{id:'id',name:'name',shortName:'short_name',tagline:'tagline',address:'address',gst:'gst',pan:'pan',phone:'phone',email:'email',brandColor:'brand_color'}}
+};
+var SB_STATE={};Object.keys(SB_SYNC).forEach(function(k){SB_STATE[k]={ready:false,snap:{},ver:{},busy:false,again:false};});
+function sbRowToDb(cfg,row,idx){
+  var o={},extra={};
+  Object.keys(row).forEach(function(k){
+    if(k.charAt(0)==='_'||(cfg.omit&&cfg.omit.indexOf(k)>=0))return;
+    if(cfg.cols[k]){var v=row[k];if(cfg.toDb&&cfg.toDb[k])v=cfg.toDb[k](v);o[cfg.cols[k]]=(v===undefined?null:v);}
+    else if(!cfg.noExtra)extra[k]=row[k];
+  });
+  if(!cfg.noExtra)o.extra=extra;
+  if(cfg.order)o[cfg.order]=idx+1;
+  return o;
+}
+function sbRowFromDb(cfg,r){
+  var o={};
+  if(!cfg.noExtra&&r.extra)Object.assign(o,r.extra);
+  Object.keys(cfg.cols).forEach(function(k){var v=r[cfg.cols[k]];if(cfg.fromDb&&cfg.fromDb[k])v=cfg.fromDb[k](v);o[k]=(v==null?(typeof o[k]!=='undefined'?o[k]:''):v);});
+  return o;
+}
+async function sbLoadTable(name){
+  var cfg=SB_SYNC[name],st=SB_STATE[name];
+  if(cfg.enabled&&!cfg.enabled()){st.ready=false;return;}
+  var q=sb.from(cfg.table).select('*');
+  if(cfg.order)q=q.order(cfg.order);else q=q.order(cfg.key);
+  var r=await q;
+  if(r.error)throw r.error;
+  st.snap={};st.ver={};
+  cfg.set(r.data.map(function(x){return sbRowFromDb(cfg,x);}));
+  // Snapshot what the app holds after loading, so the first save() sends nothing.
+  r.data.forEach(function(x){st.ver[x[cfg.key]]=x.version;});
+  cfg.get().forEach(function(row,i){st.snap[row[cfg.key]]=JSON.stringify(sbRowToDb(cfg,row,i));});
+  st.ready=true;
+}
+async function sbLoadMaster(){
+  // Order matters: suppliers before their bank details.
+  var names=['companySettings','customers','suppliers','supplierBank','stagesMaster'];
+  for(var i=0;i<names.length;i++)await sbLoadTable(names[i]);
+}
+function sbAfterReload(name){
+  try{
+    if(name==='customers'){if(qid('cus-list'))renderCustomers();popCusSel();}
+    if(name==='suppliers'||name==='supplierBank'){if(qid('sup-list'))renderSups();popSups();}
+    if(name==='stagesMaster'&&qid('stages-admin-list'))renderStagesAdmin();
+    if(name==='companySettings')applyBranding();
+  }catch(e){console.warn('Refresh after reload failed: '+e.message);}
+}
+async function sbReload(name){
+  try{await sbLoadTable(name);if(name==='suppliers')await sbLoadTable('supplierBank');sbAfterReload(name);}
+  catch(e){console.warn('Reload '+name+' failed: '+sbErrText(e));}
+}
+async function sbSyncTable(name){
+  var cfg=SB_SYNC[name],st=SB_STATE[name];
+  if(!st.ready||!sb||!currentUser)return;
+  if(cfg.enabled&&!cfg.enabled())return;
+  if(st.busy){st.again=true;return;}
+  st.busy=true;
+  var problem=null;
+  try{
+    var rows=cfg.get(),seen={};
+    for(var i=0;i<rows.length;i++){
+      var row=rows[i],id=row[cfg.key];if(id==null||id==='')continue;
+      seen[id]=true;
+      var db=sbRowToDb(cfg,row,i),js=JSON.stringify(db);
+      if(st.snap[id]===js)continue;
+      var r;
+      if(!(id in st.snap)){
+        r=await sb.from(cfg.table).insert(db).select(cfg.key+',version');
+      }else{
+        var upd=Object.assign({},db);delete upd[cfg.key];upd.version=st.ver[id];
+        r=await sb.from(cfg.table).update(upd).eq(cfg.key,id).select(cfg.key+',version');
+      }
+      if(r.error){problem=r.error;break;}
+      if(!r.data||!r.data.length){problem={code:'42501',message:'not allowed'};break;}
+      st.snap[id]=js;st.ver[id]=r.data[0].version;
+    }
+    if(!problem&&!cfg.noDelete){
+      var gone=Object.keys(st.snap).filter(function(id){return !seen[id];});
+      for(var j=0;j<gone.length;j++){
+        var d=await sb.from(cfg.table).delete().eq(cfg.key,gone[j]).select(cfg.key);
+        if(d.error){problem=d.error;break;}
+        if(!d.data||!d.data.length){problem={code:'42501',message:'not allowed'};break;}
+        delete st.snap[gone[j]];delete st.ver[gone[j]];
+      }
+    }
+  }catch(e){problem=e;}
+  st.busy=false;
+  if(problem){
+    var code=problem.code||'';
+    if(code==='40001')toast('Someone else changed this '+cfg.label+' at the same time. Showing the latest version — please make your change again.','warn');
+    else if(code==='42501'||/row-level security|not allowed/i.test(problem.message||''))toast('You do not have permission to change '+cfg.label+'s. Your change was not saved.','warn');
+    else if(code==='23503')toast('This '+cfg.label+' is still used elsewhere, so it cannot be removed.','warn');
+    else if(code==='23505')toast('A '+cfg.label+' with these details already exists. Your change was not saved.','warn');
+    else toast('Could not save '+cfg.label+' to the server: '+sbErrText(problem)+'. It will retry on the next save.','warn');
+    if(code&&code!=='FETCH_ERROR'&&!/fetch|network/i.test(problem.message||''))await sbReload(name==='supplierBank'?'suppliers':name);
+    return;
+  }
+  if(st.again){st.again=false;sbSyncTable(name);}
+}
+function sbSyncAll(){
+  if(!sb||!currentUser||!navigator.onLine)return;
+  ['companySettings','customers','stagesMaster'].forEach(function(n){sbSyncTable(n);});
+  // Bank rows reference the supplier row, so they are written after the suppliers.
+  sbSyncTable('suppliers').then(function(){return sbSyncTable('supplierBank');});
+}
+async function sbNextId(prefix){
+  var r=await sb.rpc('next_id',{p_prefix:prefix});
+  if(r.error)throw r.error;
+  return r.data;
+}
 function save(){
   try{
     var payload={
       buildVersion:BUILD_VERSION,
       POS:POS,orders:orders,rmOrders:rmOrders,stockItems:stockItems,
       inventory:inventory,drawings:drawings,bomEntries:bomEntries,
-      partMaster:partMaster,suppliers:suppliers,customers:customers,
+      partMaster:partMaster,
       routings:routings,rejectedItems:rejectedItems,
       fgBatches:fgBatches,tools:tools,dispatchQueues:dispatchQueues,
-      stagesMaster:stagesMaster,actLog:actLog,
+      actLog:actLog,
       companySettings:companySettings,batchCounters:batchCounters,
       productProcessHistory:productProcessHistory,
       rmC:rmC,bomC:bomC,stockItemC:stockItemC,dwgC:dwgC,
-      dqC:dqC,cusC:cusC,routingC:routingC,invC:invC,supC:supC,
+      dqC:dqC,routingC:routingC,invC:invC,
       fgBatchC:fgBatchC,toolC:toolC,toolMoveC:toolMoveC,rejectedItemC:rejectedItemC
     };
     localStorage.setItem(PERSIST_KEY,JSON.stringify(payload));
@@ -4502,6 +4649,8 @@ function save(){
     console.warn('ERP save failed:',e);
     if(e.name==='QuotaExceededError')toast('Storage full — export a backup from Admin settings.','warn');
   }
+  // v37: master data goes to Supabase (only the rows that changed).
+  try{sbSyncAll();}catch(e){console.warn('Server sync failed to start: '+e.message);}
 }
 // One-time self-heal for a legacy bug: two products could end up saved with the same PT- id
 // (e.g. from data created before the id-counter's self-correction logic existed). A duplicate id
@@ -4535,16 +4684,13 @@ function loadSaved(){
     if(d.stockItems&&d.stockItems.length>0)stockItems=d.stockItems;
     if(d.partMaster&&d.partMaster.length>0)partMaster=d.partMaster;
     repairDuplicatePartMasterIds();
-    if(d.suppliers)suppliers=d.suppliers;
-    if(d.customers)customers=d.customers;
     if(d.routings)routings=d.routings;
     if(d.drawings)drawings=d.drawings;
     if(d.bomEntries)bomEntries=d.bomEntries;
-    if(d.stagesMaster)stagesMaster=d.stagesMaster;
     if(d.companySettings)companySettings=Object.assign(companySettings,d.companySettings);
     if(d.stockItemC!=null)stockItemC=d.stockItemC;
-    if(d.dwgC!=null)dwgC=d.dwgC;if(d.cusC!=null)cusC=d.cusC;
-    if(d.routingC!=null)routingC=d.routingC;if(d.invC!=null)invC=d.invC;if(d.supC!=null)supC=d.supC;
+    if(d.dwgC!=null)dwgC=d.dwgC;
+    if(d.routingC!=null)routingC=d.routingC;if(d.invC!=null)invC=d.invC;
     if(d.bomC!=null)bomC=d.bomC;
     if(d.POS)POS=d.POS;
     if(d.orders)orders=d.orders;
@@ -11168,8 +11314,15 @@ function subSup(){
   if(ifsc&&!isValidIFSC(ifsc)){e.textContent='IFSC doesn\'t look right — expected format: ABCD0123456.';e.classList.add('show');return;}
   e.classList.remove('show');
   var d={name:nm,code:cd,contact:val('sco'),phone:ph,email:em,city:val('sci'),mats:val('smt'),gst:gs.toUpperCase(),pan:pan.toUpperCase(),msme:val('sms'),bank:val('sbk'),acc:val('sac'),ifsc:ifsc.toUpperCase(),terms:val('spt')||'',lead:parseInt(val('sld'))||0,active:qid('sact').value==='1'};
-  if(curEditSup){var idx=suppliers.findIndex(function(s){return s.id===curEditSup;});suppliers[idx]=Object.assign(suppliers[idx],d);}else{d.id='SUP-'+String(supC++).padStart(3,'0');suppliers.unshift(d);}
-  closeM('m-sup');renderSups();toast(curEditSup?'Supplier updated.':'Supplier added.','ok');
+  if(curEditSup){
+    var idx=suppliers.findIndex(function(s){return s.id===curEditSup;});suppliers[idx]=Object.assign(suppliers[idx],d);
+    closeM('m-sup');renderSups();popSups();toast('Supplier updated.','ok');save();
+  }else{
+    sbNextId('SUP').then(function(id){
+      d.id=id;if(!d.vendorType)d.vendorType=_supVendorType;suppliers.unshift(d);
+      closeM('m-sup');renderSups();popSups();toast('Supplier added as '+id+'.','ok');save();
+    }).catch(function(x){e.textContent='Could not get a new supplier ID from the server: '+sbErrText(x);e.classList.add('show');});
+  }
 }
 function renderSups(){
   qid('su1').textContent=suppliers.length;qid('su2').textContent=suppliers.filter(function(s){return s.active;}).length;qid('su3').textContent=suppliers.filter(function(s){return !s.active;}).length;
@@ -11181,7 +11334,7 @@ function renderSups(){
     '<div><div style="font-size:13px;font-weight:700">'+s.name+' <span class="badge'+(s.active?'':'')+'">'+(s.active?'Active':'Inactive')+'</span></div><div style="font-size:11px;color:#888;margin-top:2px">'+s.code+' · '+(s.city||'—')+' · '+s.phone+(s.mats?' · '+s.mats:'')+'</div>'+(s.gst?'<div class="mono" style="margin-top:1px;color:#888">GST: '+s.gst+(s.terms?' · '+s.terms:'')+'</div>':'')+'</div>'+
     '<div style="display:flex;gap:6px"><button class="btn sm" onclick="openLedger(\'vendor\',\''+s.id+'\')"><i class="ti ti-notebook"></i> View ledger</button><button class="btn sm" onclick="openSup(\''+s.id+'\')"><i class="ti ti-edit"></i> Edit</button><button class="btn sm'+(s.active?' danger':'')+'" onclick="togSup(\''+s.id+'\')">'+(s.active?'Deactivate':'Activate')+'</button></div></div>';}).join(''):'<div class="empty">No suppliers found.</div>';
 }
-function togSup(id){var s=suppliers.find(function(x){return x.id===id;});if(s){s.active=!s.active;renderSups();}}
+function togSup(id){var s=suppliers.find(function(x){return x.id===id;});if(s){s.active=!s.active;renderSups();popSups();save();}}
 
 // ── LEDGER (customer / vendor) ──
 // Reuses existing status logic (getRMOrderStatusInfo, isPoFullyDispatched) and the existing PO
@@ -14475,14 +14628,16 @@ function subCus() {
     var idx=customers.findIndex(function(c){return c.id===curEditCus;});
     customers[idx]=Object.assign(customers[idx],d);
     toast('Customer updated.','ok');
+    closeM('m-cus');renderCustomers();popCusSel();save();
   } else {
-    d.id='CUS-'+String(cusC++).padStart(3,'0');
-    d.addressHistory=[];
-    customers.unshift(d);
-    toast('Customer added.','ok');
+    // The ID comes from the database so two people adding customers at once never get the same one.
+    sbNextId('CUS').then(function(id){
+      d.id=id;d.addressHistory=[];
+      customers.unshift(d);
+      toast('Customer added as '+id+'.','ok');
+      closeM('m-cus');renderCustomers();popCusSel();save();
+    }).catch(function(x){e.textContent='Could not get a new customer ID from the server: '+sbErrText(x);e.classList.add('show');});
   }
-  closeM('m-cus');renderCustomers();
-  popCusSel();
 }
 function renderCustomers() {
   qid('cus-total').textContent=customers.length;
@@ -14510,7 +14665,7 @@ function renderCustomers() {
     '</div>';
   }).join(''):'<div class="empty">No customers found.</div>';
 }
-function togCus(id){var c=customers.find(function(x){return x.id===id;});if(c){c.active=!c.active;renderCustomers();}}
+function togCus(id){var c=customers.find(function(x){return x.id===id;});if(c){c.active=!c.active;renderCustomers();popCusSel();save();}}
 function popCusSel(){
   // Populate all customer dropdowns
   ['mc'].forEach(function(selId){
@@ -16253,6 +16408,11 @@ async function sbEnterApp(){
     return;
   }
   await sbLoadStaffAndPerms();
+  // currentUser is needed to decide whether bank details may be loaded, so set the role first.
+  currentUser={id:staff.id,role:staff.role};
+  try{await sbLoadMaster();}
+  catch(e){currentUser=null;await sb.auth.signOut();throw e;}
+  try{popSups();popCusSel();}catch(e){}
   errEl.style.display='none';
   if(qid('ls-pin'))qid('ls-pin').value='';
   if(qid('ls-prod-pin'))qid('ls-prod-pin').value='';
@@ -16586,6 +16746,7 @@ function saveCompanySettings(){
   document.title=companySettings.name+' ERP';
   toast('Company settings saved.','ok');
   renderAdminHub();
+  save();
 }
 
 // ── Stages Master ──
@@ -16614,6 +16775,7 @@ function moveStageAdmin(idx,dir){
   var ni=idx+dir;if(ni<0||ni>=stagesMaster.length)return;
   var tmp=stagesMaster[idx];stagesMaster[idx]=stagesMaster[ni];stagesMaster[ni]=tmp;
   renderStagesAdmin();
+  save();
 }
 
 function deleteStageAdmin(idx){
@@ -16621,6 +16783,7 @@ function deleteStageAdmin(idx){
   stagesMaster.splice(idx,1);
   renderStagesAdmin();
   toast('Stage deleted.','ok');
+  save();
 }
 
 var _editStageIdx = null;
@@ -16652,6 +16815,7 @@ function subStageAdmin(){
   }
   closeM('m-stageadmin');
   renderStagesAdmin();
+  save();
 }
 
 
